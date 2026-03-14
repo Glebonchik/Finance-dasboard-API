@@ -7,6 +7,7 @@ import (
 
 	"github.com/gibbon/finace-dashboard/internal/domain/model"
 	"github.com/gibbon/finace-dashboard/internal/domain/repository"
+	"github.com/gibbon/finace-dashboard/internal/grpc_client"
 	"github.com/google/uuid"
 )
 
@@ -52,17 +53,20 @@ type transactionServiceImpl struct {
 	txRepo       repository.TransactionRepository
 	categoryRepo repository.CategoryRepository
 	ruleRepo     repository.UserCategoryRuleRepository
+	mlClient     *grpc_client.MLClient
 }
 
 func NewTransactionService(
 	txRepo repository.TransactionRepository,
 	categoryRepo repository.CategoryRepository,
 	ruleRepo repository.UserCategoryRuleRepository,
+	mlClient *grpc_client.MLClient,
 ) TransactionService {
 	return &transactionServiceImpl{
 		txRepo:       txRepo,
 		categoryRepo: categoryRepo,
 		ruleRepo:     ruleRepo,
+		mlClient:     mlClient,
 	}
 }
 
@@ -99,7 +103,6 @@ func (s *transactionServiceImpl) GetByID(ctx context.Context, userID, id string)
 
 func (s *transactionServiceImpl) GetByUserID(ctx context.Context, filter model.TransactionFilter) ([]*model.Transaction, error) {
 	// Проверка что пользователь запрашивает свои транзакции
-	filter.UserID = filter.UserID
 	return s.txRepo.GetByUserID(ctx, filter)
 }
 
@@ -135,6 +138,10 @@ func (s *transactionServiceImpl) Delete(ctx context.Context, userID, id string) 
 }
 
 // Categorize выполняет автоматическую категоризацию транзакции
+// Алгоритм:
+// 1. Проверяем правила пользователя (keyword matching)
+// 2. Если правило найдено - используем его категорию
+// 3. Если нет - вызываем ML сервис
 func (s *transactionServiceImpl) Categorize(ctx context.Context, userID string, tx *model.Transaction) error {
 	if tx.Description == "" {
 		return nil
@@ -146,7 +153,7 @@ func (s *transactionServiceImpl) Categorize(ctx context.Context, userID string, 
 		return err
 	}
 
-	// Ищем совпадение по ключевым словам
+	// Ищем совпадение по ключевым словам (rule-based)
 	description := strings.ToUpper(tx.Description)
 	for _, rule := range rules {
 		keyword := strings.ToUpper(rule.Keyword)
@@ -157,9 +164,28 @@ func (s *transactionServiceImpl) Categorize(ctx context.Context, userID string, 
 		}
 	}
 
-	// Правило не найдено - оставляем без категории
-	// TODO: сделать тут вызов ML - сервиса
-	tx.IsConfirmed = false
+	// Правило не найдено - вызываем ML сервис
+	if s.mlClient != nil {
+		result, err := s.mlClient.Categorize(ctx, tx.Description, tx.Amount, tx.Currency)
+		if err != nil {
+			// ML сервис недоступен - оставляем без категории
+			tx.IsConfirmed = false
+			return nil
+		}
+
+		// Если уверенность высокая (>0.5) - присваиваем категорию
+		if result.Confidence > 0.5 {
+			categoryID := int(result.CategoryID)
+			tx.CategoryID = &categoryID
+			tx.IsConfirmed = true
+		} else {
+			// Низкая уверенность - требуем подтверждения
+			tx.IsConfirmed = false
+		}
+	} else {
+		// ML сервис не настроен - оставляем без категории
+		tx.IsConfirmed = false
+	}
 
 	return nil
 }

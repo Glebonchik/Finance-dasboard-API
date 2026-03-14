@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package ml;
+
+option go_package = "github.com/gibbon/finace-dashboard/internal/grpc_client/pb";
+
+service CategorizationService {
+  // Categorize определяет категорию для транзакции на основе описания
+  rpc Categorize (CategorizeRequest) returns (CategorizeResponse);
+}
+
+message CategorizeRequest {
+  // Описание транзакции (например, "ПЯТЁРОЧКА МАГАЗИН 2547")
+  string description = 1;
+  // Сумма транзакции (используется для дополнительной классификации)
+  float amount = 2;
+  // Валюта транзакции (RUB, USD, EUR)
+  string currency = 3;
+}
+
+message CategorizeResponse {
+  // ID категории
+  int32 category_id = 1;
+  // Название категории (например, "Продукты")
+  string category_name = 2;
+  // Уверенность модели (0.0 - 1.0)
+  float confidence = 3;
+}

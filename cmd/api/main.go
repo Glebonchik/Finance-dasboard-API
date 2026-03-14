@@ -13,11 +13,13 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
+	"github.com/hibiken/asynq"
 	"github.com/joho/godotenv"
 	httpSwagger "github.com/swaggo/http-swagger"
 
 	_ "github.com/gibbon/finace-dashboard/docs"
 	"github.com/gibbon/finace-dashboard/internal/config"
+	"github.com/gibbon/finace-dashboard/internal/grpc_client"
 	"github.com/gibbon/finace-dashboard/internal/handlers"
 	appMiddleware "github.com/gibbon/finace-dashboard/internal/middleware"
 	"github.com/gibbon/finace-dashboard/internal/repository"
@@ -68,9 +70,32 @@ func main() {
 		RefreshExpiry: cfg.JWT.RefreshExpiry,
 	})
 
-	txService := service.NewTransactionService(txRepo, categoryRepo, ruleRepo)
+	// Создаём ML gRPC клиент (опционально)
+	var mlClient *grpc_client.MLClient
+	mlClient, err = grpc_client.NewMLClient(grpc_client.MLClientConfig{
+		Host: cfg.MLService.Host,
+		Port: cfg.MLService.Port,
+	})
+	if err != nil {
+		log.Printf("Warning: failed to connect to ML service: %v", err)
+		log.Println("ML categorization will be disabled, rule-based categorization will be used")
+	}
 
+	txService := service.NewTransactionService(txRepo, categoryRepo, ruleRepo, mlClient)
+
+	// Создаём JWT менеджер
 	jwtManager := jwt.NewManager(cfg.JWT.Secret, cfg.JWT.AccessExpiry, cfg.JWT.RefreshExpiry)
+
+	// Создаём asynq клиент для очереди задач
+	asynqClient := asynq.NewClient(asynq.RedisClientOpt{
+		Addr: cfg.Redis.Address(),
+		Password: cfg.Redis.Password,
+		DB:       0,
+	})
+	defer asynqClient.Close()
+
+	// Создаём обработчики
+	importHandler := handlers.NewImportHandler(asynqClient)
 	authHandler := handlers.NewAuthHandler(authService)
 	authMiddleware := appMiddleware.NewAuthMiddleware(jwtManager)
 	txHandler := handlers.NewTransactionHandler(txService)
@@ -143,6 +168,13 @@ func main() {
 				r.Get("/", categoryRuleHandler.GetAll)
 				r.Delete("/{id}", categoryRuleHandler.Delete)
 			})
+
+			// Импорт транзакций
+			r.Route("/imports", func(r chi.Router) {
+				r.Post("/", importHandler.Import)
+				r.Post("/sync", importHandler.ImportSync)
+				r.Get("/status", importHandler.GetImportStatus)
+			})
 		})
 	})
 
@@ -164,6 +196,11 @@ func main() {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+
+		// Закрываем ML клиент
+		if mlClient != nil {
+			mlClient.Close()
+		}
 
 		if err := server.Shutdown(ctx); err != nil {
 			log.Fatalf("Server shutdown error: %v", err)
